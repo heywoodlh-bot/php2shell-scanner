@@ -1,0 +1,20 @@
+# Default URL paths probed for PHP2Shell (CVE-2026-109618 / CVE-2026-109619).
+/
+/index.php
+/admin/
+/admin/index.php
+/login.php
+/wp-login.php
+/wp-admin/
+/xmlrpc.php
+/upload.php
+/uploads/
+/api/
+/api/index.php
+/user.php
+/register.php
+/search.php
+/contact.php
+/phpinfo.php
+/info.php
+/test.php

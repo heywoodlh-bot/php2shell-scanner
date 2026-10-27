@@ -1,0 +1,20 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "php2shell-scanner"
+version = "0.1.0"
+description = "Scan for php2shell (CVE-2026-109618 / CVE-2026-109619)"
+readme = "README.md"
+requires-python = ">=3.8"
+
+[project.scripts]
+php2shell-scanner = "run:main"
+
+# run.py is a single top-level module; naming it explicitly disables
+# setuptools' flat-layout auto-discovery (which would choke on the repo's
+# other top-level files). php2shell.yaml and paths.txt are data files the
+# flake installs next to the module.
+[tool.setuptools]
+py-modules = ["run"]
