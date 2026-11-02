@@ -1,6 +1,6 @@
 # php2shell-scanner
 
-Check a domain and known subdomains for php2shell.
+Check a domain and known subdomains for php2shell (CVE-2026-109618 / CVE-2026-109619) — pure Python, no external tools.
 
 # Installation
 
@@ -10,11 +10,11 @@ With Nix flakes:
 nix profile install "github:heywoodlh/php2shell-scanner"
 ```
 
-If you want to run manually, install `amass` and `nuclei` and then run `run.py`.
+If you want to run manually, only Python 3.8+ is required: `python3 run.py`.
 
-## Nuclei template
+# Detection
 
-The scanner uses the PHP2Shell nuclei template bundled in this repo as `php2shell.yaml`, next to `run.py`. It is expected to always be present there.
+Detection is a pure-Python port of the PHP2Shell nuclei template: a control request captures the PHP version, then crafted multipart probes look for the OOM fatal (`Allowed memory size of ... bytes exhausted ... Unknown`); with no crash, the version alone decides (`VULNERABLE` below the fixed patch releases, `EOL` for < 8.2, `FIXED` otherwise). A crash match on a *fixed* version is classified as fixed — memory exhaustion happens on fixed builds too, only the OOM longjmp corruption is version-dependent.
 
 # Usage
 
@@ -27,7 +27,7 @@ php2shell-scanner -t "http://example.com" -t "http://localhost:9080"
 
 Each `--target` is validated before scanning: it must be an `http://` or `https://` URL that answers an HTTP request. Untrusted TLS certificates are accepted (only reachability is checked). If a host does not respond, the scan aborts with an error. `--target` and `--domain` can be combined.
 
-Scan a domain and all its subdomains:
+Scan a domain and all its subdomains (passive enumeration via Certificate Transparency logs on crt.sh — no amass needed):
 
 ```
 php2shell-scanner --subdomain --domain example.com
@@ -41,7 +41,7 @@ php2shell-scanner --subdomain -d example.com -d somedomain.com
 
 ## Paths
 
-The nuclei template triggers the bug with a multipart POST, so any endpoint served by PHP is worth probing. Paths apply only to `--domain` targets — each path is joined to every domain. A URL passed with `--target` is always scanned exactly as given, with no path expansion. By default the paths in [`paths.txt`](paths.txt) are used. Add your own:
+The detection probes trigger the bug with a multipart POST, so any endpoint served by PHP is worth probing. Paths apply only to `--domain` targets — each path is joined to every domain. A URL passed with `--target` is always scanned exactly as given, with no path expansion. By default the paths in [`paths.txt`](paths.txt) are used. Add your own:
 
 ```
 php2shell-scanner --domain example.com -p /upload.php -p /api/index.php
@@ -82,9 +82,19 @@ If you already serve the bind-shell script somewhere (any path, plain text), pas
 
 The chain requires the same conditions as the public PoCs: Apache prefork + mod_php, `display_errors=1`, `memory_limit=8M`, `max_input_vars=1000`, single worker, `KeepAlive Off`, and an amd64 PHP 8.4/8.5 build whose libphp offsets match the profile (heap geometry is build- and environment-sensitive; leaks are retried and rotate the worker between attempts). Authorized testing only.
 
+## Tests and CI
+
+`tests/unit_test.py` covers the pure functions (probe builder, version verdict, host short forms, subdomain filtering, detection classification with a stubbed HTTP layer):
+
+```
+python3 -m unittest tests.unit_test -v
+```
+
+`tests/integration.sh` spins up a live vulnerable container (official `php:8.4.26-apache` with the required php.ini/apache config under `tests/docker/`, host networking) and tests everything against it: vulnerable target detected, fixed target (`php:8.4.27-apache`) **not** reported vulnerable, blind command execution as www-data, and a full bind-shell session. GitHub Actions runs both suites on every push/PR (`.github/workflows/test.yml`).
+
 ## Logging
 
-Write only the findings (nuclei's matched results) to a file with `--log`:
+Write only the findings (matched results) to a file with `--log`:
 
 ```
 php2shell-scanner --domain example.com --log findings.txt

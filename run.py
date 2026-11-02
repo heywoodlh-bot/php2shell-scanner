@@ -2,20 +2,17 @@
 
 import argparse
 import os
-import re
-import shutil
 import ssl
-import subprocess
 import sys
-import tempfile
 import urllib.error
 import urllib.parse
 import urllib.request
 
-# The nuclei template and paths.txt ship alongside this script (in the repo and
-# in the Nix store).
+import scan
+import subdomains
+
+# paths.txt ships alongside this script (in the repo and in the Nix store).
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
-TEMPLATE = os.path.join(SCRIPT_DIR, "php2shell.yaml")
 DEFAULT_PATH_FILE = os.path.join(SCRIPT_DIR, "paths.txt")
 
 USER_AGENT = "php2shell-scanner"
@@ -43,7 +40,7 @@ parser.add_argument(
 parser.add_argument(
     "--subdomain",
     action="store_true",
-    help="Enumerate and scan subdomains of each --domain with amass",
+    help="Enumerate and scan subdomains of each --domain (crt.sh)",
 )
 parser.add_argument(
     "-p",
@@ -146,13 +143,6 @@ parser.add_argument(
 )
 
 
-def have(cmd):
-    if shutil.which(cmd) is None:
-        print("Missing " + cmd + " executable.")
-        return False
-    return True
-
-
 def _ssl_context():
     ctx = ssl.create_default_context()
     ctx.check_hostname = False
@@ -235,82 +225,58 @@ def apply_paths(targets, paths):
 
 
 def enumerate_subdomains(domain):
-    print("Enumerating subdomains for " + domain + " with amass...")
-    try:
-        result = subprocess.run(
-            ["amass", "enum", "-passive", "-norecursive", "-d", domain],
-            capture_output=True,
-            text=True,
-            check=False,
-        )
-    except OSError as exc:
-        print("Failed to run amass: " + str(exc))
-        return []
-
-    if result.stdout:
-        sys.stdout.write(result.stdout)
-    if result.stderr:
-        sys.stderr.write(result.stderr)
-
-    pattern = re.compile(
-        r"\b((?:[a-zA-Z0-9_-]+\.)+" + re.escape(domain) + r")\b"
-    )
-    hosts = set()
-    for match in pattern.finditer(result.stdout):
-        hosts.add(match.group(1).lower())
-    # Always include the apex domain itself.
-    hosts.add(domain.lower())
-    return sorted(hosts)
+    """Passive subdomain enumeration via Certificate Transparency (crt.sh)."""
+    print("Enumerating subdomains for " + domain + " via crt.sh...")
+    return subdomains.enumerate_subdomains(domain)
 
 
 def is_vulnerable(target):
-    """Run the nuclei template against a single target; True if it matches."""
-    fd, list_path = tempfile.mkstemp(prefix="php2shell-targets-", suffix=".txt")
-    try:
-        with os.fdopen(fd, "w") as fh:
-            fh.write(target + "\n")
-        result = subprocess.run(
-            ["nuclei", "-silent", "-t", TEMPLATE, "-l", list_path],
-            capture_output=True,
-            text=True,
-            check=False,
-        )
-    finally:
-        os.unlink(list_path)
-
-    findings = result.stdout.strip()
-    if findings:
-        print(findings)
-    return bool(findings)
+    """True only when the memory-exhaustion behavior was observed."""
+    res = scan.check_url(target)
+    if res["result"] != scan.UNKNOWN:
+        print(scan.finding_line(res))
+    return res["result"] == scan.MEMORY_EXHAUSTION
 
 
-def run_nuclei(targets, log_path=None):
+def run_scan(targets, log_path=None):
     if not targets:
         print("No targets to scan.")
         return 0
 
-    if not os.path.isfile(TEMPLATE):
-        print("Missing nuclei template: " + TEMPLATE)
-        return 1
-
     print("Scanning " + str(len(targets)) + " target(s) for php2shell...")
 
+    log_fh = None
     if log_path:
         log_dir = os.path.dirname(log_path)
         if log_dir:
             os.makedirs(log_dir, exist_ok=True)
+        log_fh = open(log_path, "a")
 
-    fd, list_path = tempfile.mkstemp(prefix="php2shell-targets-", suffix=".txt")
+    findings = 0
     try:
-        with os.fdopen(fd, "w") as fh:
-            fh.write("\n".join(targets) + "\n")
-        cmd = ["nuclei", "-silent", "-t", TEMPLATE, "-l", list_path]
-        if log_path:
-            cmd += ["-o", log_path]
-        result = subprocess.run(cmd, check=False)
-        return result.returncode
+        for target in targets:
+            if "://" not in target:
+                target = "http://" + target
+            res = scan.check_url(target)
+            if res["result"] in (scan.MEMORY_EXHAUSTION, scan.VERSION_VULNERABLE,
+                                 scan.VERSION_EOL):
+                line = scan.finding_line(res)
+                print(line)
+                findings += 1
+                if log_fh:
+                    log_fh.write(line + "\n")
+            elif res["result"] == scan.FIXED:
+                print("[php2shell] " + target + " runs fixed PHP "
+                      + res["version"] + " (OOM fatal present, not vulnerable)")
+            elif res["version"]:
+                print("[php2shell] no detection on " + target
+                      + " (PHP " + res["version"] + ")")
     finally:
-        os.unlink(list_path)
+        if log_fh:
+            log_fh.close()
+    print("Done: " + str(findings) + " finding(s) across "
+          + str(len(targets)) + " target(s).")
+    return 0
 
 def run_exploit(args):
     """Verify the vulnerability on the single --target, then exploit it."""
@@ -363,23 +329,6 @@ def main():
     if not args.target and not args.domain:
         parser.error("provide --target and/or --domain")
 
-    if args.exploit:
-        # The exploit chain needs only the target URL; skip the amass check.
-        if not have("nuclei"):
-            print("Missing dependencies. Exiting.")
-            sys.exit(1)
-    else:
-        # Check every dependency so all missing ones are reported at once,
-        # rather than exiting on the first.
-        required = ["nuclei", "amass"]
-        missing = False
-        for cmd in required:
-            if not have(cmd):
-                missing = True
-        if missing:
-            print("Missing dependencies. Exiting.")
-            sys.exit(1)
-
     invalid = []
     for target in args.target:
         ok, detail = validate_web_server(target)
@@ -418,7 +367,7 @@ def main():
             seen.add(target)
             unique.append(target)
 
-    sys.exit(run_nuclei(unique, args.log))
+    sys.exit(run_scan(unique, args.log))
 
 
 if __name__ == "__main__":
