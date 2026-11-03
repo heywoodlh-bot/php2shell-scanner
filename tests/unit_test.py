@@ -189,5 +189,44 @@ class CheckUrlUnitTest(unittest.TestCase):
         self.assertEqual(res["result"], scan.UNKNOWN)
 
 
+class IniFactsTest(unittest.TestCase):
+    def test_parse_memory_limit(self):
+        text = ("Fatal error: Allowed memory size of 33554432 bytes exhausted "
+                "(tried to allocate 2097152 bytes) in Unknown on line 0")
+        result = {}
+        scan._parse_ini_facts(text, result)
+        self.assertEqual(result["memory_limit"], 33554432)
+
+    def test_parse_max_vars(self):
+        text = ("Warning: PHP Request Startup: Input variables exceeded 5000. "
+                "To increase the limit change max_input_vars in php.ini.")
+        result = {}
+        scan._parse_ini_facts(text, result)
+        self.assertEqual(result["max_input_vars"], 5000)
+
+    def test_no_facts(self):
+        result = {}
+        scan._parse_ini_facts("nothing here", result)
+        self.assertIsNone(result.get("memory_limit"))
+        self.assertIsNone(result.get("max_input_vars"))
+
+    def test_detect_max_vars_escalation(self):
+        class FakeTarget:
+            def __init__(self):
+                self.calls = []
+
+            def post_body(self, body, content_type, **kw):
+                self.calls.append(len(body))
+                # the warning appears once enough fields are sent
+                if len(self.calls) >= 2:
+                    return (b"HTTP/1.1 200 OK\r\n\r\nWarning: Input variables "
+                            b"exceeded 5000. To increase the limit change "
+                            b"max_input_vars in php.ini.")
+                return b"HTTP/1.1 200 OK\r\n\r\nOK"
+
+        limit = scan.detect_max_vars(FakeTarget(), verbose=False)
+        self.assertEqual(limit, 5000)
+
+
 if __name__ == "__main__":
     unittest.main()

